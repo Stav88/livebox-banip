@@ -1,0 +1,183 @@
+#!/bin/bash
+
+set -e
+
+SOURCE='src'
+DESTINATION='dest'
+CMD="$(basename "$0")"
+VERBOSITY_NONE=0
+VERBOSITY_INFO=1
+VERBOSITY_DEBUG=2
+verbose=0
+direction="$SOURCE"
+
+function usage() {
+  cat << EOF
+Usage: ${CMD} [OPTIONS] --list|-l
+  or:  ${CMD} [OPTIONS] --add <IP>
+  or:  ${CMD} [OPTIONS] --remove <IP>
+  or:  ${CMD} [OPTIONS] --help|-h
+List, add or remove IP address to livebox ban list
+
+      --add=<IP>    add <IP> to ban list
+      --destination ban or list ban flow from local network to <IP>
+  -h, --help        display this help and exit
+  -l, --list        list all ban ip
+      --remove=<IP> remove <IP> from ban list
+      --source      ban or list ban flow from <IP> to local network (default)
+  -v, --verbose     Verbose mode.  Multiple -v options increase the verbosity.
+                    The maximum is 2.
+                    level 1: output API result json
+                    level 2: output jq/sysbus params
+EOF
+}
+
+#
+# @link https://stackoverflow.com/questions/1527049/how-can-i-join-elements-of-an-array-in-bash
+function array_join {
+  local d=${1-} f=${2-}
+  if shift 2; then
+    printf %s "$f" "${@/#/$d}"
+  fi
+}
+
+function list() {
+# Model:
+# {
+#    "Id": string,
+#    "Target": string,
+#    "Status": string,
+#    "Class": string,
+#    "IPVersion": int,
+#    "Protocol": string,
+#    "DestinationPort": string,
+#    "SourcePort": string,
+#    "DestinationMACAddress": string,
+#    "SourceMACAddress": string,
+#    "DestinationPrefix": string,
+#    "SourcePrefix": string,
+#    "TargetChain": string,
+#    "Description": string,
+#    "Enable": boolean
+#  }
+#  sysbus Firewall:getCustomRule
+#  sysbus Firewall:getCustomRule chain=Custom_V6In
+#  sysbus Firewall:getCustomRule chain=Custom_V6Out
+
+  local filter
+  local condition=(
+    '(.Target == "Reject" or .Target == "Drop")'
+    '.DestinationPort == ""'
+    '.SourcePort == ""'
+  )
+  if [[ "$direction" == "$SOURCE" ]]; then
+    condition+=('.DestinationPrefix == ""')
+  else
+    condition+=('.SourcePrefix == ""')
+  fi
+  filter='.status | map(select('"$(array_join ' and ' "${condition[@]}")"'))'
+
+
+  if [ "$verbose" -eq "${VERBOSITY_NONE}" ]; then
+    if [[ "$direction" == "$SOURCE" ]]; then
+      filter="${filter} | map(.SourcePrefix)"
+    else
+      filter="${filter} | map(.DestinationPrefix)"
+    fi
+    filter="${filter} | join(\"\\n\") | @text"
+  fi
+  if [ "$verbose" -ge "${VERBOSITY_DEBUG}" ]; then
+    echo "filter=${filter}" >&2
+  fi
+  sysbus Firewall:getCustomRule | jq -r "${filter}"
+}
+
+function canonize() {
+  string="$1"
+  string="${string//\//_}"
+  string="${string//[^a-zA-Z0-9_-]/-}"
+  echo "${string}"
+}
+
+function add() {
+  params=(
+    id="banip-${direction}-$(canonize "$1")"
+    action="Drop"
+    chain="Custom"
+#    description=""
+#    destinationPort="1-65535"
+    enable=true
+    ipversion=4
+    persistent=true
+#    protocol="17,6,51,47,50"
+#    sourcePort="1-65535"
+  )
+  if [[ "$direction" == "$SOURCE" ]]; then
+    params+=(sourcePrefix="$1/32")
+    params+=(destinationPrefix="0.0.0.0/0")
+  else
+    params+=(sourcePrefix="0.0.0.0/0")
+    params+=(destinationPrefix="$1/32")
+  fi
+  if [ "$verbose" -ge "${VERBOSITY_DEBUG}" ]; then
+    echo "params=" "${params[@]}" >&2
+  fi
+  result=$(sysbus -raw Firewall:setCustomRule "${params[@]}" | jq -r .result)
+  if [[ 'null' != "$(echo "${result}" | jq -r .errors)" ]]; then
+    echo "${result}" | jq >&2
+    exit 1
+  fi
+
+  if [ "$verbose" -ge "${VERBOSITY_INFO}" ]; then
+    echo "$result" | jq
+  fi
+}
+
+function remove() {
+  params=(
+    id="banip-${direction}-$(canonize "$1")"
+    chain=Custom
+  )
+
+  if [ "$verbose" -ge "${VERBOSITY_DEBUG}" ]; then
+    echo "params=" "${params[@]}" >&2
+  fi
+  result=$(sysbus -raw Firewall:deleteCustomRule "${params[@]}" | jq -r .result)
+  if [[ 'null' != "$(echo "${result}" | jq -r .errors)" ]]; then
+    echo "${result}" | jq >&2
+    exit 1
+  fi
+
+  if [ "$verbose" -ge "${VERBOSITY_INFO}" ]; then
+    echo "$result" | jq
+  fi
+}
+
+getopt=$(getopt -o vhl \
+                -l help,destination,source,verbose,list,add:,remove: \
+                -n "$CMD" \
+                -- "$@")
+
+eval set -- "$getopt"
+
+cmd=()
+while true; do
+  case "$1" in
+    -h | --help ) cmd=(usage);       shift ;;
+    -l | --list ) cmd=(list);        shift ;;
+    --add )       cmd=(add "$2");    shift 2 ;;
+    --remove )    cmd=(remove "$2"); shift 2 ;;
+    --destination )  direction="$DESTINATION"; shift ;;
+    --source )       direction="$SOURCE"; shift ;;
+    -v | --verbose ) verbose=$((verbose+1)); shift ;;
+    -- ) shift; break ;;
+    * ) break ;;
+  esac
+done
+
+if [ "${#cmd[@]}" -eq 0 ];then
+  usage;
+  exit 255
+fi
+
+"${cmd[@]}"
